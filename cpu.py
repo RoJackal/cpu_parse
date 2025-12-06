@@ -1,27 +1,28 @@
-#!/usr/bin/env python3 
-def get_cpu_stat():
-    cores = set()
-    physical_cores = set()
-    cpu_model = None
-    cache_size = None
-    cpu_mhz = None
-    vendor_id = None
-    physical_id = None
+#!/usr/bin/env python3
+import platform
+import json
+import sys
+try:
+    import distro
+except ImportError:
+    distro = None
 
-    with open("/proc/cpuinfo") as f:
+def get_cpu_stat():
+    # Pre-allocate common fields
+    cores = set()
+    cpu_model = cache_size = cpu_mhz = vendor_id = physical_cores_count = None
+    
+    # Fast /proc/cpuinfo parsing - read once, minimal string ops
+    with open("/proc/cpuinfo", "r", buffering=8192) as f:
         for line in f:
             if ':' not in line:
                 continue
-            key, value = line.split(':', 1)
-            key = key.strip()
-            value = value.strip()
-
+            key, value = (x.strip() for x in line.split(':', 1))
+            
             if key == "processor":
-                cores.add(value)  # unique logical processors
-            elif key == "cpu cores":
-                # cpu cores is per physical package, only set on first occurrence
-                if physical_id is None:
-                    physical_cores_count = value
+                cores.add(value)
+            elif key == "cpu cores" and physical_cores_count is None:
+                physical_cores_count = value
             elif key == "model name" and cpu_model is None:
                 cpu_model = value
             elif key == "cache size" and cache_size is None:
@@ -30,37 +31,68 @@ def get_cpu_stat():
                 cpu_mhz = value
             elif key == "vendor_id" and vendor_id is None:
                 vendor_id = value
-            elif key == "physical id" and physical_id is None:
-                physical_id = value
 
-    # Get memory size
-    mem_total_kb = 0
-    with open("/proc/meminfo") as memf:
-        for line in memf:
-            if line.startswith("MemTotal:"):
-                parts = line.split()
-                mem_total_kb = int(parts[1])  # in kilobytes
-                break
-    mem_total_gb = mem_total_kb / 1024 / 1024  # convert to GB approx
+    # Fast memory parsing - read first line only
+    with open("/proc/meminfo", "r", buffering=4096) as f:
+        mem_total_kb = int(next(f).split()[1])
+    mem_total_gb = mem_total_kb / 1048576.0  # Direct KB->GB
 
-    return {
-        "number_of_logical_cores": len(cores),
-        "cpu_model": cpu_model,
-        "cache_size": cache_size,
-        "cpu_mhz": cpu_mhz,
-        "vendor_id": vendor_id,
-        "physical_cores_count": physical_cores_count if 'physical_cores_count' in locals() else None,
-        "memory_gb": mem_total_gb
+    # OS info
+    uname = platform.uname()
+    
+    # Distro info with fallback
+    distro_name = "Unknown"
+    distro_version = "Unknown"
+    if distro:
+        distro_name = distro.name(pretty=True) or "Unknown"
+        distro_version = distro.version() or "Unknown"
+
+    stats = {
+        "distribution": {
+            "name": distro_name,
+            "version": distro_version
+        },
+        "kernel": uname.release,
+        "cpu": {
+            "vendor": vendor_id,
+            "model": cpu_model,
+            "logical_cores": len(cores),
+            "physical_cores": physical_cores_count,
+            "cache_size": cache_size,
+            "frequency_mhz": cpu_mhz
+        },
+        "memory_gb": round(mem_total_gb, 2),
+        "os_system": uname.system,
+        "os_version": uname.version
     }
+    
+    return stats
+
+def print_text(stats):
+    """Print human-readable text output"""
+    print("Distribution: {} {}".format(stats["distribution"]["name"], stats["distribution"]["version"]))
+    print("Kernel: {}".format(stats["kernel"]))
+    print("CPU Vendor: {}".format(stats["cpu"]["vendor"]))
+    print("CPU Model: {}".format(stats["cpu"]["model"]))
+    print("Logical Cores: {}".format(stats["cpu"]["logical_cores"]))
+    if stats["cpu"]["physical_cores"]:
+        print("Physical Cores: {}".format(stats["cpu"]["physical_cores"]))
+    print("Cache Size: {}".format(stats["cpu"]["cache_size"]))
+    print("CPU Frequency (MHz): {}".format(stats["cpu"]["frequency_mhz"]))
+    print("Total Memory (GB): {:.2f}".format(stats["memory_gb"]))
+
+def print_json(stats):
+    """Print JSON output"""
+    print(json.dumps(stats, indent=2, sort_keys=True))
 
 if __name__ == "__main__":
+    # Parse command line argument
+    json_output = "--json" in sys.argv
+    
     stats = get_cpu_stat()
-    print(f"CPU Vendor: {stats['vendor_id']}")
-    print(f"CPU Model: {stats['cpu_model']}")
-    print(f"Logical Cores: {stats['number_of_logical_cores']}")
-    if stats['physical_cores_count']:
-        print(f"Physical Cores: {stats['physical_cores_count']}")
-    print(f"Cache Size: {stats['cache_size']}")
-    print(f"CPU Frequency (MHz): {stats['cpu_mhz']}")
-    print(f"Total Memory (GB): {stats['memory_gb']:.2f}")
+    
+    if json_output:
+        print_json(stats)
+    else:
+        print_text(stats)
 
