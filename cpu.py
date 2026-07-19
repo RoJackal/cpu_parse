@@ -1,250 +1,288 @@
 #!/usr/bin/env python3
-"""CPU and System hardware parser for Linux systems."""
+"""Report Linux CPU, memory, kernel, and distribution information."""
+from __future__ import annotations
 import argparse
-import json
 import os
-import platform
 import sys
-from glob import glob
-try:
-    import distro
-except ImportError:
-    distro = None
+PROC_CPUINFO = "/proc/cpuinfo"
+PROC_MEMINFO = "/proc/meminfo"
+CPU_SYSFS = "/sys/devices/system/cpu"
+CPUFREQ_SYSFS = f"{CPU_SYSFS}/cpufreq"
+OS_RELEASE_PATHS = ("/etc/os-release", "/usr/lib/os-release")
 def _read_first_line(path: str) -> str | None:
-    """Reads the first line of a file safely."""
+    """Return the stripped first line of a text file, or None on failure."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.readline().strip()
-    except OSError:
-        return None
-def _read_file(path: str) -> str | None:
-    """Reads the entire content of a file safely."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read().strip()
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            return stream.readline().strip()
     except OSError:
         return None
 def _read_int(path: str) -> int | None:
-    """Reads an integer from a file."""
-    s = _read_first_line(path)
-    if not s:
+    """Return the integer stored in a text file, or None when unavailable."""
+    value = _read_first_line(path)
+    if value is None:
         return None
     try:
-        return int(s)
+        return int(value)
     except ValueError:
         return None
-def _khz_to_mhz(khz: int | None) -> float | None:
-    """Converts kHz to MHz rounded to 1 decimal."""
-    if khz is None:
-        return None
-    return round(khz / 1000.0, 1)
-def _detect_distribution() -> dict:
-    """Detects Linux distribution details."""
-    out = {"name": "Unknown", "version": "Unknown", "pretty": "Unknown"}
-    try:
-        if distro:
-            out["name"] = distro.name(pretty=False) or "Unknown"
-            out["version"] = distro.version(pretty=False) or "Unknown"
-            out["pretty"] = (distro.name(pretty=True) or f"{out['name']} {out['version']}".strip())
-            return out
-    except (AttributeError, ValueError):
-        pass
-    pretty = version = name = None
-    try:
-        if os.path.exists("/etc/os-release"):
-            with open("/etc/os-release", "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("PRETTY_NAME="):
-                        pretty = line.split("=", 1)[1].strip().strip('"')
-                    elif line.startswith("NAME="):
-                        name = line.split("=", 1)[1].strip().strip('"')
-                    elif line.startswith("VERSION_ID="):
-                        version = line.split("=", 1)[1].strip().strip('"')
-    except OSError:
-        pass
-    if pretty:
-        out["pretty"] = pretty
-    if name:
-        out["name"] = name
-    if version:
-        out["version"] = version
-    if out["pretty"] == "Unknown":
-        out["pretty"] = f"{out['name']} {out['version']}".strip()
-    return out
-def _update_cpu_data(key: str, value: str, data: dict):
-    """Helper to update the CPU data dictionary from proc info."""
-    if key == "processor":
-        data["logical_cores"] += 1
-    elif key == "vendor_id" and data["vendor"] == "Unknown":
-        data["vendor"] = value
-    elif key == "model name" and data["model"] == "Unknown":
-        data["model"] = value
-    elif key == "cache size" and data["cache_size"] == "Unknown":
-        data["cache_size"] = value
-    elif key == "cpu MHz" and data["cpu_mhz"] is None:
+def _khz_to_mhz(value: int | None) -> float | None:
+    """Convert an optional frequency from kHz to MHz."""
+    return None if value is None else round(value / 1_000, 1)
+def _unquote_os_release(value: str) -> str:
+    """Decode the quoting and escapes commonly used by os-release."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value.replace(r"\$", "$").replace(r'\"', '"').replace(r"\\", "\\")
+def _detect_distribution() -> dict[str, str]:
+    """Read Linux distribution details without third-party dependencies."""
+    release: dict[str, str] = {}
+    for path in OS_RELEASE_PATHS:
         try:
-            data["cpu_mhz"] = float(value)
-        except ValueError:
-            pass
-    elif key == "physical id":
-        try:
-            data["current_socket"] = int(value)
-        except ValueError:
-            data["current_socket"] = None
-    elif key == "cpu cores" and data["current_socket"] is not None:
-        if data["current_socket"] not in data["sockets"]:
-            try:
-                data["sockets"][data["current_socket"]] = int(value)
-            except ValueError:
-                pass
-def _parse_proc_cpuinfo() -> dict:
-    """Parses /proc/cpuinfo for core and model details."""
-    data = {
-        "logical_cores": 0, "vendor": "Unknown", "model": "Unknown",
-        "cache_size": "Unknown", "cpu_mhz": None, "sockets": {}, "current_socket": None
-    }
+            with open(path, encoding="utf-8", errors="replace") as stream:
+                for raw_line in stream:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    release[key] = _unquote_os_release(value)
+            break
+        except OSError:
+            continue
+    name = release.get("NAME") or "Unknown"
+    version = release.get("VERSION_ID") or "Unknown"
+    pretty = release.get("PRETTY_NAME") or " ".join(part for part in (name, version) if part != "Unknown") or "Unknown"
+    return {"name": name, "version": version, "pretty": pretty}
+def _parse_proc_cpuinfo() -> dict[str, object]:
+    """Parse /proc/cpuinfo once for identity, topology, and frequency data."""
+    logical_cores = 0
+    vendor = "Unknown"
+    model = "Unknown"
+    fallback_model = "Unknown"
+    cache_size = "Unknown"
+    frequency_mhz: float | None = None
+    core_pairs: set[tuple[str, str]] = set()
+    socket_core_counts: dict[str, int] = {}
+    socket_id: str | None = None
+    core_id: str | None = None
+    cores_in_socket: int | None = None
+    def finish_processor() -> None:
+        nonlocal socket_id, core_id, cores_in_socket
+        if socket_id is not None and core_id is not None:
+            core_pairs.add((socket_id, core_id))
+        if socket_id is not None and cores_in_socket is not None:
+            socket_core_counts[socket_id] = cores_in_socket
+        socket_id = None
+        core_id = None
+        cores_in_socket = None
     try:
-        with open("/proc/cpuinfo", "r", buffering=8192, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if ":" not in line:
+        with open(PROC_CPUINFO, encoding="utf-8", errors="replace", buffering=16_384) as stream:
+            for raw_line in stream:
+                if raw_line[0] in "\r\n":
+                    finish_processor()
                     continue
-                key, _, value = line.partition(":")
-                _update_cpu_data(key.strip(), value.strip(), data)
-    except FileNotFoundError:
-        print("Error: /proc/cpuinfo not found.", file=sys.stderr)
-        sys.exit(1)
-    physical_cores = sum(data["sockets"].values()) if data["sockets"] else 0
+                key, separator, value = raw_line.partition(":")
+                if not separator:
+                    continue
+                key = key.strip()
+                value = value.strip()
+                if key == "processor":
+                    logical_cores += 1
+                elif key == "vendor_id" and vendor == "Unknown":
+                    vendor = value
+                elif key in {"CPU implementer", "vendor"} and vendor == "Unknown":
+                    vendor = value
+                elif key == "model name" and model == "Unknown":
+                    model = value
+                elif key in {"Processor", "Hardware", "cpu model"} and fallback_model == "Unknown":
+                    fallback_model = value
+                elif key == "cache size" and cache_size == "Unknown":
+                    cache_size = value
+                elif key == "cpu MHz" and frequency_mhz is None:
+                    try:
+                        frequency_mhz = round(float(value), 1)
+                    except ValueError:
+                        pass
+                elif key == "physical id":
+                    socket_id = value
+                elif key == "core id":
+                    core_id = value
+                elif key == "cpu cores":
+                    try:
+                        cores_in_socket = int(value)
+                    except ValueError:
+                        pass
+            finish_processor()
+    except OSError:
+        logical_cores = os.cpu_count() or 0
+    physical_cores = len(core_pairs) or sum(socket_core_counts.values())
     return {
-        "vendor": data["vendor"], "model": data["model"], "logical_cores": data["logical_cores"],
-        "physical_cores": physical_cores, "cache_size": data["cache_size"],
-        "frequency_mhz_cur": round(data["cpu_mhz"], 1) if data["cpu_mhz"] is not None else None,
+        "vendor": vendor,
+        "model": model if model != "Unknown" else fallback_model,
+        "logical_cores": logical_cores or os.cpu_count() or 0,
+        "physical_cores": physical_cores,
+        "cache_size": cache_size,
+        "frequency_mhz_cur": frequency_mhz,
     }
-def _cpu_topology_from_sysfs() -> dict:
-    """Fallback physical core counting using sysfs topology."""
-    pairs = set()
-    cpu_dirs = sorted(glob("/sys/devices/system/cpu/cpu[0-9]*/topology"))
-    for tdir in cpu_dirs:
-        pkg = _read_int(os.path.join(tdir, "physical_package_id"))
-        core = _read_int(os.path.join(tdir, "core_id"))
-        if pkg is not None and core is not None:
-            pairs.add((pkg, core))
-    return {"physical_cores": len(pairs) if pairs else 0}
-def _cpufreq_from_sysfs() -> dict:
-    """Reads CPU frequencies from sysfs."""
-    policy0 = "/sys/devices/system/cpu/cpufreq/policy0"
-    policy = policy0 if os.path.isdir(policy0) else None
-    if not policy:
-        policies = sorted(glob("/sys/devices/system/cpu/cpufreq/policy*"))
-        policy = policies[0] if policies else None
-    if not policy:
+def _physical_cores_from_sysfs() -> int:
+    """Count unique physical package and core pairs exposed by sysfs."""
+    pairs: set[tuple[int, int]] = set()
+    try:
+        entries = os.scandir(CPU_SYSFS)
+    except OSError:
+        return 0
+    with entries:
+        for entry in entries:
+            if not entry.name.startswith("cpu") or not entry.name[3:].isdigit():
+                continue
+            topology = f"{entry.path}/topology"
+            package_id = _read_int(f"{topology}/physical_package_id")
+            core_id = _read_int(f"{topology}/core_id")
+            if package_id is not None and core_id is not None:
+                pairs.add((package_id, core_id))
+    return len(pairs)
+def _first_cpufreq_policy() -> str | None:
+    """Return policy0 or the numerically first available CPUFreq policy."""
+    policy0 = f"{CPUFREQ_SYSFS}/policy0"
+    if os.path.isdir(policy0):
+        return policy0
+    try:
+        with os.scandir(CPUFREQ_SYSFS) as entries:
+            policies = [
+                entry
+                for entry in entries
+                if entry.is_dir() and entry.name.startswith("policy") and entry.name[6:].isdigit()
+            ]
+    except OSError:
+        return None
+    return min(policies, key=lambda entry: int(entry.name[6:])).path if policies else None
+def _cpufreq_from_sysfs() -> dict[str, float | str | None]:
+    """Read current and maximum CPU frequencies from the first policy."""
+    policy = _first_cpufreq_policy()
+    if policy is None:
         return {"frequency_mhz_cur": None, "frequency_mhz_max": None, "cpufreq_policy": None}
-    cur_khz = _read_int(os.path.join(policy, "scaling_cur_freq"))
-    max_khz = _read_int(os.path.join(policy, "cpuinfo_max_freq"))
+    current = _read_int(f"{policy}/scaling_cur_freq")
+    if current is None:
+        current = _read_int(f"{policy}/cpuinfo_cur_freq")
+    maximum = _read_int(f"{policy}/cpuinfo_max_freq")
+    if maximum is None:
+        maximum = _read_int(f"{policy}/scaling_max_freq")
     return {
-        "frequency_mhz_cur": _khz_to_mhz(cur_khz),
-        "frequency_mhz_max": _khz_to_mhz(max_khz),
+        "frequency_mhz_cur": _khz_to_mhz(current),
+        "frequency_mhz_max": _khz_to_mhz(maximum),
         "cpufreq_policy": os.path.basename(policy),
     }
-def _mem_gib() -> float | None:
-    """Reads total memory in GiB from /proc/meminfo."""
-    try:
-        with open("/proc/meminfo", "r", buffering=4096, encoding="utf-8", errors="replace") as f:
-            line = next(f, "")
-        if not line:
-            return None
-        parts = line.split()
-        if len(parts) < 2:
-            return None
-        return round(int(parts[1]) / 1048576.0, 2)
-    except (OSError, ValueError, StopIteration):
+def _memory_gib() -> float | None:
+    """Read total system memory from /proc/meminfo."""
+    line = _read_first_line(PROC_MEMINFO)
+    if line is None:
         return None
-def get_cpu_stat() -> dict:
-    """Aggregates all CPU and system statistics."""
-    stats = {
-        "distribution": _detect_distribution(), "kernel": "Unknown",
-        "cpu": {
-            "vendor": "Unknown", "model": "Unknown", "logical_cores": 0,
-            "physical_cores": 0, "cache_size": "Unknown",
-            "frequency_mhz_cur": None, "frequency_mhz_max": None,
-        },
-        "memory_gib": None, "os_system": platform.system(), "os_version": platform.version(),
-    }
+    key, separator, value = line.partition(":")
+    if not separator or key != "MemTotal":
+        return None
+    fields = value.split()
     try:
-        stats["kernel"] = platform.uname().release
-    except (AttributeError, OSError):
-        pass
-    stats["cpu"].update(_parse_proc_cpuinfo())
-    if not stats["cpu"]["physical_cores"]:
-        topo = _cpu_topology_from_sysfs()
-        if topo["physical_cores"]:
-            stats["cpu"]["physical_cores"] = topo["physical_cores"]
-    freq = _cpufreq_from_sysfs()
-    if freq["frequency_mhz_cur"] is not None:
-        stats["cpu"]["frequency_mhz_cur"] = freq["frequency_mhz_cur"]
-    if freq["frequency_mhz_max"] is not None:
-        stats["cpu"]["frequency_mhz_max"] = freq["frequency_mhz_max"]
-    stats["cpu"]["cpufreq_policy"] = freq["cpufreq_policy"]
-    stats["memory_gib"] = _mem_gib()
-    return stats
-def print_short(stats: dict) -> None:
-    """Prints a one-liner summary of system stats."""
+        return round(int(fields[0]) / 1_048_576, 2)
+    except (IndexError, ValueError):
+        return None
+def get_cpu_stat() -> dict[str, object]:
+    """Collect system statistics with one pass over each relevant interface."""
+    uname = os.uname()
+    cpu = _parse_proc_cpuinfo()
+    if not cpu["physical_cores"]:
+        cpu["physical_cores"] = _physical_cores_from_sysfs()
+    frequency = _cpufreq_from_sysfs()
+    if frequency["frequency_mhz_cur"] is not None:
+        cpu["frequency_mhz_cur"] = frequency["frequency_mhz_cur"]
+    cpu["frequency_mhz_max"] = frequency["frequency_mhz_max"]
+    cpu["cpufreq_policy"] = frequency["cpufreq_policy"]
+    return {
+        "distribution": _detect_distribution(),
+        "kernel": uname.release,
+        "cpu": cpu,
+        "memory_gib": _memory_gib(),
+        "os_system": uname.sysname,
+        "os_version": uname.version,
+    }
+def _format_frequency(current: float | None, maximum: float | None) -> str:
+    """Format current and maximum frequency for compact output."""
+    if current is not None and maximum is not None:
+        return f"{current:.0f}/{maximum:.0f}MHz"
+    if current is not None:
+        return f"{current:.0f}MHz"
+    if maximum is not None:
+        return f"max{maximum:.0f}MHz"
+    return "n/a"
+def print_short(stats: dict[str, object]) -> None:
+    """Print a compact monitoring summary."""
     cpu = stats["cpu"]
-    distro_pretty = stats["distribution"]["pretty"]
+    distribution = stats["distribution"]
     model = cpu["model"] if cpu["model"] != "Unknown" else "Unknown CPU"
-    model_short = (model[:28] + "..") if len(model) > 29 else model
-    cur, mx = cpu.get("frequency_mhz_cur"), cpu.get("frequency_mhz_max")
-    if cur is not None and mx is not None:
-        freq = f"{cur:.0f}/{mx:.0f}MHz"
-    elif cur is not None:
-        freq = f"{cur:.0f}MHz"
-    elif mx is not None:
-        freq = f"max{mx:.0f}MHz"
-    else:
-        freq = "n/a"
-    mem = stats["memory_gib"]
-    mem_s = f"{mem:.1f}GiB" if mem is not None else "n/a"
-    out = f"{distro_pretty} | CPU:{model_short:<30} {cpu['logical_cores']}t/"
-    out += f"{cpu['physical_cores'] or '?'}c | RAM:{mem_s:<8} | {freq}"
-    print(out)
-def print_text(stats: dict) -> None:
-    """Prints detailed system stats in plain text."""
+    model_short = f"{model[:28]}.." if len(model) > 29 else model
+    frequency = _format_frequency(cpu["frequency_mhz_cur"], cpu["frequency_mhz_max"])
+    memory = stats["memory_gib"]
+    memory_text = f"{memory:.1f}GiB" if memory is not None else "n/a"
+    sys.stdout.write(
+        f"{distribution['pretty']} | CPU:{model_short:<30} "
+        f"{cpu['logical_cores']}t/{cpu['physical_cores'] or '?'}c | "
+        f"RAM:{memory_text:<8} | {frequency}\n"
+    )
+def print_text(stats: dict[str, object], *, verbose: bool = False) -> None:
+    """Print detailed system statistics as plain text."""
     cpu = stats["cpu"]
-    print(f"Distribution: {stats['distribution']['pretty']}")
-    print(f"Kernel: {stats['kernel']}")
-    print(f"CPU Vendor: {cpu['vendor']}")
-    print(f"CPU Model: {cpu['model']}")
-    print(f"Logical Cores (threads): {cpu['logical_cores']}")
-    print(f"Physical Cores: {cpu['physical_cores'] if cpu['physical_cores'] else 'Unknown'}")
-    print(f"Cache Size: {cpu['cache_size']}")
-    cur, mx = cpu.get("frequency_mhz_cur"), cpu.get("frequency_mhz_max")
-    print(f"CPU Frequency Current (MHz): {f'{cur:.1f}' if cur is not None else 'Unknown'}")
-    print(f"CPU Frequency Max (MHz): {f'{mx:.1f}' if mx is not None else 'Unknown'}")
-    if cpu.get("cpufreq_policy"):
-        print(f"CPUFreq Policy: {cpu['cpufreq_policy']}")
-    mem = stats["memory_gib"]
-    print(f"Total Memory (GiB): {f'{mem:.2f}' if mem is not None else 'Unknown'}")
-def print_json(stats: dict) -> None:
-    """Prints system stats in JSON format."""
-    print(json.dumps(stats, indent=2, sort_keys=True))
-def main() -> int:
-    """Main entry point for the hardware parser."""
+    distribution = stats["distribution"]
+    current = cpu["frequency_mhz_cur"]
+    maximum = cpu["frequency_mhz_max"]
+    memory = stats["memory_gib"]
+    lines = [
+        f"Distribution: {distribution['pretty']}",
+        f"Kernel: {stats['kernel']}",
+        f"CPU Vendor: {cpu['vendor']}",
+        f"CPU Model: {cpu['model']}",
+        f"Logical Cores (threads): {cpu['logical_cores']}",
+        f"Physical Cores: {cpu['physical_cores'] or 'Unknown'}",
+        f"Cache Size: {cpu['cache_size']}",
+        f"CPU Frequency Current (MHz): {current:.1f}"
+        if current is not None
+        else "CPU Frequency Current (MHz): Unknown",
+        f"CPU Frequency Max (MHz): {maximum:.1f}" if maximum is not None else "CPU Frequency Max (MHz): Unknown",
+    ]
+    if cpu["cpufreq_policy"]:
+        lines.append(f"CPUFreq Policy: {cpu['cpufreq_policy']}")
+    lines.append(f"Total Memory (GiB): {memory:.2f}" if memory is not None else "Total Memory (GiB): Unknown")
+    if verbose:
+        lines.extend((f"OS System: {stats['os_system']}", f"OS Version: {stats['os_version']}"))
+    sys.stdout.write("\n".join(lines) + "\n")
+def print_json(stats: dict[str, object]) -> None:
+    """Print system statistics as deterministic, formatted JSON."""
+    import json
+    sys.stdout.write(json.dumps(stats, indent=2, sort_keys=True) + "\n")
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Fast Linux system hardware parser",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  %(prog)s\n  %(prog)s --short\n  %(prog)s --json",
+        epilog="Examples:\n  %(prog)s\n  %(prog)s --short\n  %(prog)s --json\n  %(prog)s --verbose",
+        allow_abbrev=False,
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
-    parser.add_argument("--json", action="store_true", help="JSON output")
-    parser.add_argument("--short", action="store_true", help="Compact monitoring output")
-    args = parser.parse_args()
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--json", action="store_true", help="output formatted JSON")
+    modes.add_argument("--short", action="store_true", help="output one compact monitoring line")
+    modes.add_argument("-v", "--verbose", action="store_true", help="include additional operating-system details")
+    return parser.parse_args(argv)
+def main(argv: list[str] | None = None) -> int:
+    """Run the hardware parser."""
+    if not sys.platform.startswith("linux"):
+        sys.stderr.write("Error: this program supports Linux only.\n")
+        return 1
+    args = _parse_args(argv)
     stats = get_cpu_stat()
     if args.json:
         print_json(stats)
     elif args.short:
         print_short(stats)
     else:
-        print_text(stats)
+        print_text(stats, verbose=args.verbose)
     return 0
 if __name__ == "__main__":
     raise SystemExit(main())
