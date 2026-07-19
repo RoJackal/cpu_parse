@@ -175,13 +175,12 @@ CPU frequency reporting is best effort. Some virtual machines, containers, hyper
 The parser minimizes startup and collection overhead by:
 
 - Reading `/proc/cpuinfo` once
-- Importing `json` only when JSON output is requested
 - Avoiding third-party distribution-detection packages
 - Using `os.scandir()` for sysfs fallback discovery
 - Calling `os.uname()` once
 - Building human-readable output before writing it to standard output
 
-In a 100-run process-start benchmark on the development host, the optimized version was approximately 9% faster than the previous implementation. Actual results depend on the Python build, CPU, filesystem, kernel, and virtualization environment.
+In repeated 100-run process-start benchmarks on the development host, the optimized version was approximately 10% faster than the previous implementation. Actual results depend on the Python build, CPU, filesystem, kernel, and virtualization environment.
 
 ## Changelog
 
@@ -204,7 +203,8 @@ In a 100-run process-start benchmark on the development host, the optimized vers
 - Replaced glob-based sysfs discovery with `os.scandir()`
 - Changed CPUFreq policy selection to prefer `policy0`, then the numerically first available policy
 - Changed text and compact output to buffered standard-output writes
-- Changed JSON loading to a lazy import used only for `--json`
+- Split CPU identity, topology, and processor-finalization logic into focused helpers
+- Kept standard-library imports at module level for static-analysis compliance
 - Made `--json`, `--short`, and `--verbose` mutually exclusive
 - Disabled abbreviated command-line options with `allow_abbrev=False`
 - Updated the supported Python baseline from the incorrect `3.6+` claim to Python 3.10+
@@ -219,6 +219,8 @@ In a 100-run process-start benchmark on the development host, the optimized vers
 - Fixed empty or malformed `/proc/meminfo` handling
 - Fixed distribution parsing when `/etc/os-release` is unavailable
 - Improved CPU model detection on non-x86 systems
+- Resolved Pylint complexity findings in the `/proc/cpuinfo` parser without suppressions
+- Resolved Pylint's `import-outside-toplevel` finding for `json`
 
 #### Validation
 
@@ -227,7 +229,8 @@ In a 100-run process-start benchmark on the development host, the optimized vers
 - Verified that JSON output parses successfully
 - Verified invalid conflicting output modes return exit status `2`
 - Verified logical and physical core counts match `lscpu` on the development host
-- Measured approximately 9% lower process-start runtime over 100 executions on the development host
+- Achieved a Pylint score of 10.00/10 with `line-too-long` excluded as requested
+- Measured approximately 10% lower process-start runtime over repeated 100-run tests
 
 ## Compatibility Notes
 

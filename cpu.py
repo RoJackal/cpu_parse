@@ -2,6 +2,7 @@
 """Report Linux CPU, memory, kernel, and distribution information."""
 from __future__ import annotations
 import argparse
+import json
 import os
 import sys
 PROC_CPUINFO = "/proc/cpuinfo"
@@ -9,6 +10,21 @@ PROC_MEMINFO = "/proc/meminfo"
 CPU_SYSFS = "/sys/devices/system/cpu"
 CPUFREQ_SYSFS = f"{CPU_SYSFS}/cpufreq"
 OS_RELEASE_PATHS = ("/etc/os-release", "/usr/lib/os-release")
+CPU_IDENTITY_KEYS = frozenset(
+    {
+        "processor",
+        "vendor_id",
+        "CPU implementer",
+        "vendor",
+        "model name",
+        "Processor",
+        "Hardware",
+        "cpu model",
+        "cache size",
+        "cpu MHz",
+    }
+)
+CPU_TOPOLOGY_KEYS = frozenset({"physical id", "core id", "cpu cores"})
 def _read_first_line(path: str) -> str | None:
     """Return the stripped first line of a text file, or None on failure."""
     try:
@@ -51,78 +67,111 @@ def _detect_distribution() -> dict[str, str]:
             continue
     name = release.get("NAME") or "Unknown"
     version = release.get("VERSION_ID") or "Unknown"
-    pretty = release.get("PRETTY_NAME") or " ".join(part for part in (name, version) if part != "Unknown") or "Unknown"
-    return {"name": name, "version": version, "pretty": pretty}
+    pretty = release.get("PRETTY_NAME")
+    if not pretty:
+        pretty = " ".join(part for part in (name, version) if part != "Unknown")
+    return {"name": name, "version": version, "pretty": pretty or "Unknown"}
+def _new_cpu_identity() -> dict[str, object]:
+    """Return initial values collected from /proc/cpuinfo."""
+    return {
+        "logical_cores": 0,
+        "vendor": "Unknown",
+        "model": "Unknown",
+        "fallback_model": "Unknown",
+        "cache_size": "Unknown",
+        "frequency_mhz_cur": None,
+    }
+def _update_cpu_identity(key: str, value: str, identity: dict[str, object]) -> None:
+    """Update CPU identity and frequency fields from one cpuinfo entry."""
+    if key == "processor":
+        identity["logical_cores"] += 1
+    elif key in {"vendor_id", "CPU implementer", "vendor"}:
+        if identity["vendor"] == "Unknown":
+            identity["vendor"] = value
+    elif key == "model name":
+        if identity["model"] == "Unknown":
+            identity["model"] = value
+    elif key in {"Processor", "Hardware", "cpu model"}:
+        if identity["fallback_model"] == "Unknown":
+            identity["fallback_model"] = value
+    elif key == "cache size":
+        if identity["cache_size"] == "Unknown":
+            identity["cache_size"] = value
+    elif key == "cpu MHz" and identity["frequency_mhz_cur"] is None:
+        try:
+            identity["frequency_mhz_cur"] = round(float(value), 1)
+        except ValueError:
+            pass
+def _update_cpu_topology(key: str, value: str, topology: dict[str, object]) -> None:
+    """Update the current processor's topology fields."""
+    if key == "physical id":
+        topology["socket_id"] = value
+    elif key == "core id":
+        topology["core_id"] = value
+    elif key == "cpu cores":
+        try:
+            topology["cores_in_socket"] = int(value)
+        except ValueError:
+            pass
+def _finish_processor(
+    topology: dict[str, object],
+    core_pairs: set[tuple[str, str]],
+    socket_core_counts: dict[str, int],
+) -> None:
+    """Store one processor's topology and reset its temporary fields."""
+    socket_id = topology["socket_id"]
+    core_id = topology["core_id"]
+    cores_in_socket = topology["cores_in_socket"]
+    if socket_id is not None and core_id is not None:
+        core_pairs.add((socket_id, core_id))
+    if socket_id is not None and cores_in_socket is not None:
+        socket_core_counts[socket_id] = cores_in_socket
+    topology.update(socket_id=None, core_id=None, cores_in_socket=None)
 def _parse_proc_cpuinfo() -> dict[str, object]:
     """Parse /proc/cpuinfo once for identity, topology, and frequency data."""
-    logical_cores = 0
-    vendor = "Unknown"
-    model = "Unknown"
-    fallback_model = "Unknown"
-    cache_size = "Unknown"
-    frequency_mhz: float | None = None
+    identity = _new_cpu_identity()
     core_pairs: set[tuple[str, str]] = set()
     socket_core_counts: dict[str, int] = {}
-    socket_id: str | None = None
-    core_id: str | None = None
-    cores_in_socket: int | None = None
-    def finish_processor() -> None:
-        nonlocal socket_id, core_id, cores_in_socket
-        if socket_id is not None and core_id is not None:
-            core_pairs.add((socket_id, core_id))
-        if socket_id is not None and cores_in_socket is not None:
-            socket_core_counts[socket_id] = cores_in_socket
-        socket_id = None
-        core_id = None
-        cores_in_socket = None
+    topology: dict[str, object] = {
+        "socket_id": None,
+        "core_id": None,
+        "cores_in_socket": None,
+    }
     try:
-        with open(PROC_CPUINFO, encoding="utf-8", errors="replace", buffering=16_384) as stream:
+        with open(
+            PROC_CPUINFO,
+            encoding="utf-8",
+            errors="replace",
+            buffering=16_384,
+        ) as stream:
             for raw_line in stream:
                 if raw_line[0] in "\r\n":
-                    finish_processor()
+                    _finish_processor(topology, core_pairs, socket_core_counts)
                     continue
                 key, separator, value = raw_line.partition(":")
                 if not separator:
                     continue
                 key = key.strip()
                 value = value.strip()
-                if key == "processor":
-                    logical_cores += 1
-                elif key == "vendor_id" and vendor == "Unknown":
-                    vendor = value
-                elif key in {"CPU implementer", "vendor"} and vendor == "Unknown":
-                    vendor = value
-                elif key == "model name" and model == "Unknown":
-                    model = value
-                elif key in {"Processor", "Hardware", "cpu model"} and fallback_model == "Unknown":
-                    fallback_model = value
-                elif key == "cache size" and cache_size == "Unknown":
-                    cache_size = value
-                elif key == "cpu MHz" and frequency_mhz is None:
-                    try:
-                        frequency_mhz = round(float(value), 1)
-                    except ValueError:
-                        pass
-                elif key == "physical id":
-                    socket_id = value
-                elif key == "core id":
-                    core_id = value
-                elif key == "cpu cores":
-                    try:
-                        cores_in_socket = int(value)
-                    except ValueError:
-                        pass
-            finish_processor()
+                if key in CPU_IDENTITY_KEYS:
+                    _update_cpu_identity(key, value, identity)
+                elif key in CPU_TOPOLOGY_KEYS:
+                    _update_cpu_topology(key, value, topology)
+            _finish_processor(topology, core_pairs, socket_core_counts)
     except OSError:
-        logical_cores = os.cpu_count() or 0
+        identity["logical_cores"] = os.cpu_count() or 0
     physical_cores = len(core_pairs) or sum(socket_core_counts.values())
     return {
-        "vendor": vendor,
-        "model": model if model != "Unknown" else fallback_model,
-        "logical_cores": logical_cores or os.cpu_count() or 0,
+        "vendor": identity["vendor"],
+        "model": (
+            identity["model"]
+            if identity["model"] != "Unknown"
+            else identity["fallback_model"]
+        ),
+        "logical_cores": identity["logical_cores"] or os.cpu_count() or 0,
         "physical_cores": physical_cores,
-        "cache_size": cache_size,
-        "frequency_mhz_cur": frequency_mhz,
+        "cache_size": identity["cache_size"],
+        "frequency_mhz_cur": identity["frequency_mhz_cur"],
     }
 def _physical_cores_from_sysfs() -> int:
     """Count unique physical package and core pairs exposed by sysfs."""
@@ -245,30 +294,45 @@ def print_text(stats: dict[str, object], *, verbose: bool = False) -> None:
         f"CPU Frequency Current (MHz): {current:.1f}"
         if current is not None
         else "CPU Frequency Current (MHz): Unknown",
-        f"CPU Frequency Max (MHz): {maximum:.1f}" if maximum is not None else "CPU Frequency Max (MHz): Unknown",
+        f"CPU Frequency Max (MHz): {maximum:.1f}"
+        if maximum is not None
+        else "CPU Frequency Max (MHz): Unknown",
     ]
     if cpu["cpufreq_policy"]:
         lines.append(f"CPUFreq Policy: {cpu['cpufreq_policy']}")
-    lines.append(f"Total Memory (GiB): {memory:.2f}" if memory is not None else "Total Memory (GiB): Unknown")
+    lines.append(
+        f"Total Memory (GiB): {memory:.2f}"
+        if memory is not None
+        else "Total Memory (GiB): Unknown"
+    )
     if verbose:
-        lines.extend((f"OS System: {stats['os_system']}", f"OS Version: {stats['os_version']}"))
+        lines.extend(
+            (f"OS System: {stats['os_system']}", f"OS Version: {stats['os_version']}")
+        )
     sys.stdout.write("\n".join(lines) + "\n")
 def print_json(stats: dict[str, object]) -> None:
     """Print system statistics as deterministic, formatted JSON."""
-    import json
     sys.stdout.write(json.dumps(stats, indent=2, sort_keys=True) + "\n")
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Fast Linux system hardware parser",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  %(prog)s\n  %(prog)s --short\n  %(prog)s --json\n  %(prog)s --verbose",
+        epilog=(
+            "Examples:\n  %(prog)s\n  %(prog)s --short\n"
+            "  %(prog)s --json\n  %(prog)s --verbose"
+        ),
         allow_abbrev=False,
     )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--json", action="store_true", help="output formatted JSON")
     modes.add_argument("--short", action="store_true", help="output one compact monitoring line")
-    modes.add_argument("-v", "--verbose", action="store_true", help="include additional operating-system details")
+    modes.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="include additional operating-system details",
+    )
     return parser.parse_args(argv)
 def main(argv: list[str] | None = None) -> int:
     """Run the hardware parser."""
