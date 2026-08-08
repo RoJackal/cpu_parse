@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Report Linux CPU, memory, kernel, and distribution information."""
+import json
 import os
 import sys
 PROC_CPUINFO = "/proc/cpuinfo"
@@ -47,36 +48,76 @@ def _finish_topology(
         core_pairs.add((socket_id, core_id))
     if socket_id is not None and cores_in_socket is not None:
         socket_core_counts[socket_id] = cores_in_socket
-def _parse_proc_cpuinfo() -> tuple[dict[str, object], list[int]]:
-    """Parse procfs once for CPU identity, topology, and frequency ranges."""
-    try:
-        with open(PROC_CPUINFO, "rb", buffering=0) as stream:
-            data = stream.read()
-    except OSError:
-        logical = os.cpu_count() or 0
-        return {
-            "vendor": UNKNOWN,
-            "model": UNKNOWN,
-            "logical_cores": logical,
-            "physical_cores": 0,
-            "packages": 0,
-            "cache_size": UNKNOWN,
-            "frequency_mhz_cur": None,
-            "frequency_mhz_cur_min": None,
-        }, list(range(logical))
-    vendor = UNKNOWN
-    model = UNKNOWN
-    fallback_model = UNKNOWN
-    cache_size = UNKNOWN
+def _unknown_cpuinfo() -> tuple[dict[str, object], list[int]]:
+    """Return safe CPU defaults when procfs is unavailable."""
+    logical = os.cpu_count() or 0
+    return {
+        "vendor": UNKNOWN,
+        "model": UNKNOWN,
+        "logical_cores": logical,
+        "physical_cores": 0,
+        "packages": 0,
+        "cache_size": UNKNOWN,
+        "frequency_mhz_cur": None,
+        "frequency_mhz_cur_min": None,
+    }, list(range(logical))
+def _parse_cpu_identity(lines: list[bytes]) -> tuple[dict[str, str], list[int]]:
+    """Extract CPU identity fields and logical processor identifiers."""
+    identity = {
+        "vendor": UNKNOWN,
+        "model": UNKNOWN,
+        "fallback_model": UNKNOWN,
+        "cache_size": UNKNOWN,
+    }
     processor_ids: list[int] = []
+    for raw_line in lines:
+        key, separator, raw_value = raw_line.partition(b":")
+        if not separator:
+            continue
+        key = key.strip()
+        value = raw_value.strip()
+        if key == b"processor":
+            try:
+                processor_ids.append(int(value))
+            except ValueError:
+                pass
+        elif key in {b"vendor_id", b"CPU implementer", b"vendor"}:
+            if identity["vendor"] == UNKNOWN:
+                identity["vendor"] = _decode(value)
+        elif key == b"model name":
+            if identity["model"] == UNKNOWN:
+                identity["model"] = _decode(value)
+        elif key in {b"Processor", b"Hardware", b"cpu model"}:
+            if identity["fallback_model"] == UNKNOWN:
+                identity["fallback_model"] = _decode(value)
+        elif key == b"cache size" and identity["cache_size"] == UNKNOWN:
+            identity["cache_size"] = _decode(value)
+    if identity["model"] == UNKNOWN:
+        identity["model"] = identity["fallback_model"]
+    del identity["fallback_model"]
+    return identity, processor_ids
+def _parse_cpu_frequencies(lines: list[bytes]) -> tuple[float | None, float | None]:
+    """Extract the minimum and maximum frequencies reported by procfs."""
+    frequencies: list[float] = []
+    for raw_line in lines:
+        key, separator, raw_value = raw_line.partition(b":")
+        if not separator or key.strip() != b"cpu MHz":
+            continue
+        try:
+            frequencies.append(float(raw_value))
+        except ValueError:
+            continue
+    if not frequencies:
+        return None, None
+    return round(min(frequencies), 1), round(max(frequencies), 1)
+def _parse_cpu_topology(lines: list[bytes]) -> tuple[int, int]:
+    """Extract physical core and package counts from procfs."""
     core_pairs: set[tuple[bytes, bytes]] = set()
     socket_core_counts: dict[bytes, int] = {}
     socket_id: bytes | None = None
     core_id: bytes | None = None
     cores_in_socket: int | None = None
-    frequency_min: float | None = None
-    frequency_max: float | None = None
-    for raw_line in data.splitlines():
+    for raw_line in lines:
         if not raw_line:
             _finish_topology(
                 socket_id,
@@ -94,31 +135,7 @@ def _parse_proc_cpuinfo() -> tuple[dict[str, object], list[int]]:
             continue
         key = key.strip()
         value = raw_value.strip()
-        if key == b"processor":
-            try:
-                processor_ids.append(int(value))
-            except ValueError:
-                pass
-        elif key in {b"vendor_id", b"CPU implementer", b"vendor"}:
-            if vendor == UNKNOWN:
-                vendor = _decode(value)
-        elif key == b"model name":
-            if model == UNKNOWN:
-                model = _decode(value)
-        elif key in {b"Processor", b"Hardware", b"cpu model"}:
-            if fallback_model == UNKNOWN:
-                fallback_model = _decode(value)
-        elif key == b"cache size":
-            if cache_size == UNKNOWN:
-                cache_size = _decode(value)
-        elif key == b"cpu MHz":
-            try:
-                frequency = float(value)
-            except ValueError:
-                continue
-            frequency_min = frequency if frequency_min is None else min(frequency_min, frequency)
-            frequency_max = frequency if frequency_max is None else max(frequency_max, frequency)
-        elif key == b"physical id":
+        if key == b"physical id":
             socket_id = value
         elif key == b"core id":
             core_id = value
@@ -134,18 +151,29 @@ def _parse_proc_cpuinfo() -> tuple[dict[str, object], list[int]]:
         core_pairs,
         socket_core_counts,
     )
-    logical = len(processor_ids) or os.cpu_count() or 0
     physical = len(core_pairs) or sum(socket_core_counts.values())
     packages = len({pair[0] for pair in core_pairs}) or len(socket_core_counts)
+    return physical, packages
+def _parse_proc_cpuinfo() -> tuple[dict[str, object], list[int]]:
+    """Parse procfs once for CPU identity, topology, and frequency ranges."""
+    try:
+        with open(PROC_CPUINFO, "rb", buffering=0) as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        return _unknown_cpuinfo()
+    identity, processor_ids = _parse_cpu_identity(lines)
+    frequency_min, frequency_max = _parse_cpu_frequencies(lines)
+    physical, packages = _parse_cpu_topology(lines)
+    logical = len(processor_ids) or os.cpu_count() or 0
     return {
-        "vendor": vendor,
-        "model": model if model != UNKNOWN else fallback_model,
+        "vendor": identity["vendor"],
+        "model": identity["model"],
         "logical_cores": logical,
         "physical_cores": physical,
         "packages": packages,
-        "cache_size": cache_size,
-        "frequency_mhz_cur": round(frequency_max, 1) if frequency_max is not None else None,
-        "frequency_mhz_cur_min": round(frequency_min, 1) if frequency_min is not None else None,
+        "cache_size": identity["cache_size"],
+        "frequency_mhz_cur": frequency_max,
+        "frequency_mhz_cur_min": frequency_min,
     }, processor_ids or list(range(logical))
 def _topology_from_sysfs(processor_ids: list[int]) -> tuple[int, int]:
     """Count unique cores and packages using stable kernel topology masks."""
@@ -348,8 +376,7 @@ def print_text(stats: dict[str, object], *, verbose: bool = False) -> None:
         lines.extend((f"OS System: {stats['os_system']}", f"OS Version: {stats['os_version']}"))
     sys.stdout.write("\n".join(lines) + "\n")
 def print_json(stats: dict[str, object]) -> None:
-    """Print deterministic, formatted JSON while keeping normal startup lean."""
-    import json
+    """Print deterministic, formatted JSON."""
     sys.stdout.write(json.dumps(stats, indent=2, sort_keys=True) + "\n")
 def _parse_args(argv: list[str]) -> tuple[str | None, str | None]:
     """Parse the small, fixed CLI without argparse's startup overhead."""
